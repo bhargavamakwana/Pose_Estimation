@@ -9,10 +9,11 @@ from utils import train_load_util
 import matplotlib.pyplot as plt
 import glob
 import cv2
+import pickle
 
 # Hyper-parametrs
-batch_size = 16
-epochs = 20
+batch_size = 1
+epochs = 2
 
 
 class Base(nn.Module):
@@ -56,7 +57,7 @@ class NetGated(nn.Module):
         self.layer2 = block(inp_size, dim)
         self.layer3 = nn.Linear(1024, 64)
         self.layer4 = nn.Linear(64, 2)
-        self.layer5 = nn.Linear(512, 12)
+        self.layer5 = nn.Linear(512, 7)
 
     def forward(self, rgb, depth):
         x_rgb = self.layer1(rgb)
@@ -80,7 +81,7 @@ class Attention(nn.Module):
         self.net_gated = NetGated(block, inp_size, dim, batch_size)
         self.linear1 = nn.Linear(8192, 512)
         self.linear2 = nn.Linear(1024, 16)
-        self.linear3 = nn.Linear(1024, 12)
+        self.linear3 = nn.Linear(1024, 7)
         self.embed = None
     def forward(self, rgb, depth):
         _, self.embed = self.net_gated(rgb, depth)
@@ -97,119 +98,72 @@ class Attention(nn.Module):
         return x.float()
 
 
-class PoseDataset(Dataset):
-    """
-    Custom class to load data
-    """
-    def __init__(self, X_train, labels=None, transform=None):
-        self.x_train = []
-        self.transform = transform
-        for img, label in zip(X_train, labels):
-            self.x_train.append([img[0], img[1], label])
-    def __len__(self):
-        return len(self.x_train)
-
-    def __getitem__(self, index):
-        img = self.x_train[index][0]
-        depth = self.x_train[index][1]
-        if self.transform:
-            x = self.transform(img)
-            x_depth = self.transform(depth)
-        return {'image': x, 'depth': x_depth, 'label': torch.from_numpy(self.x_train[index][2])}
-
-
-
-files_color = glob.glob("./chess/seq-01/*.color.png")
-files_depth = glob.glob("./chess/seq-01/*.depth.png")
-files_labels = glob.glob("./chess/seq-01/*.txt")
-
-files_color.sort()
-files_depth.sort()
-files_labels.sort()
-
-transform = transforms.Compose(
-    [transforms.ToTensor(),
-     transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
-
-
-# read and convert images to numpy array as well as labels.
-def read_rgb_and_depth_to_numpy(rgb_files, depth_files):
-    X_train = []
-    for img, depth in zip(rgb_files, depth_files):
-        X_train.append([cv2.resize(cv2.imread(img), (224,224)), cv2.resize(cv2.imread(img), (224,224))])
-    return np.array(X_train)
-
-def generate_labels(labels_list):
-    """
-    Utility Function to generate the labels.
-    Find the relative pose and append matrix elements as labels.
-    """
-
-    labels = []
-    poses = []
-    def relative_rotations(poses):
-        """
-        find relative rotation between two frames
-        """
-        labels = []
-        for r0, r1 in zip(poses, poses[1:]):
-            r0_r1 = r1.dot(r0.T)
-            r0_r1 = r0_r1.ravel()[:12]
-            labels.append(r0_r1)
-        return labels
-    for i in range(len(files_labels)):
-        label_list = []
-        pose = np.loadtxt(files_labels[i])
-        poses.append(pose)
-
-    labels = relative_rotations(poses)
-
-    return np.array(labels)
-
-
-
-
-
 # Initialize Optimizer and Loss function objects
 
 
-#net = NetGated(Base, 3, 64)
 net = Attention(NetGated, Base, 3, 64, batch_size=16)
 loss_fn = torch.nn.MSELoss()
 optim = torch.optim.Adam(net.parameters(), lr=1e-8)
+mae_loss =  torch.nn.L1Loss()
+def r2_loss(pred, target):
+    target_mean = torch.mean(target)
+    ss_tot = torch.sum((target-target_mean)**2)
+    ss_res = torch.sum((target-pred)**2)
+    r2 = 1- ss_res/ss_tot
+    return r2
+
 
 train_loss_list = []
 test_loss_list = []
 
-for i in range(1, 7):
+test_mae_list = []
+test_r2_list = []
+pred_list = []
+label_list = []
+for i in range(1, 2):
     base_path = "./chess/seq-0" + str(i) + "/"
     trainloader, testloader = train_load_util(base_path, batch_size)
     for epoch in range(epochs):
         print(f'Training for Epoch {epoch}')
-        for i, data in enumerate(trainloader, 0):
+        for j, data in enumerate(trainloader):
             timgs, tdepths, labels = data['image'], data['depth'], data['label']
+            timgs = torch.squeeze(timgs, 0)
+            tdepths = torch.squeeze(tdepths, 0)
+            labels = torch.squeeze(labels, 0)
             pred = net(timgs, tdepths)
-            loss = loss_fn(pred, labels.float())
+            loss = loss_fn(pred, labels.float()[-1])
             loss.backward()
             optim.step()
-
-            if i % 2 == 0:
+            if j % 2 == 0:
                 loss = loss.item()
                 print(f'Train loss: {loss:>7f}')
                 train_loss_list.append(loss)
 
-        best_loss = float("inf")
-        with torch.no_grad():
-            for i, data in enumerate(trainloader, 0):
-                timgs, tdepths, labels = data['image'], data['depth'], data['label']
-                pred = net(timgs, tdepths)
-                loss = loss_fn(pred, labels.float())
-                if i % 2 == 0:
-                    loss = loss.item()
-                    best_loss = min(best_loss, loss)
-                    test_loss_list.append(loss)
-        print(f'##################### Test loss: {best_loss:>7f} ######################')
-plt.plot(loss_list, color='magenta', marker='o',mfc='pink' ) #plot the data
-plt.ylabel('Train Loss') #set the label for y axis
-plt.xlabel('indexes') #set the label for x-axis
-plt.show() #display the graph
+    best_loss = float("inf")
+    print(f'Testing Started for Epoch {epoch}')
+    with torch.no_grad():
+        for i, data in enumerate(testloader, 0):
+            timgs, tdepths, labels = data['image'], data['depth'], data['label']
+            timgs = torch.squeeze(timgs, 0)
+            tdepths = torch.squeeze(tdepths, 0)
+            labels = torch.squeeze(labels, 0)
+            pred = net(timgs, tdepths)
+            pred_list.append(pred.detach().numpy())
+            label_list.append(labels.float().detach().numpy())
+
+            loss = loss_fn(pred, labels.float()[-1])
+            if i % 2 == 0:
+                loss = loss.item()
+                best_loss = min(best_loss, loss)
+                test_loss_list.append(loss)
+        print(f'##################### Test loss: {best_loss:>7f} Acc: {100*abs(best_loss/sum(labels.float().ravel()))} ######################')
+    with open("pred_list_" + str(i) + ".pkl", "wb+") as f:
+        pickle.dump(pred_list, f)
+
+    with open("label_list_" + str(i) + ".pkl", "wb+") as f:
+        pickle.dump(label_list, f)
+
+#plt.plot(loss_list, color='magenta', marker='o',mfc='pink' ) #plot the data
+#plt.ylabel('Train Loss') #set the label for y axis
+#plt.xlabel('indexes') #set the label for x-axis
+#plt.show() #display the graph

@@ -6,33 +6,51 @@ import torchvision
 import torchvision.transforms as transforms
 import numpy as np
 from torch.utils.data import Dataset, random_split
+from torch.utils.data.sampler import Sampler, BatchSampler
+from scipy.spatial.transform import Rotation as R
 import glob
 import cv2
-
-
-
-
 
 
 class PoseDataset(Dataset):
     """
     Custom class to load data
     """
-    def __init__(self, X_train, labels=None, transform=None):
+    def __init__(self, X_train, labels=None, transform=None, batch_size=16):
         self.x_train = []
         self.transform = transform
+        self.window = batch_size
+        self.count = 0
         for img, label in zip(X_train, labels):
             self.x_train.append([img[0], img[1], label])
+
     def __len__(self):
         return len(self.x_train)
 
     def __getitem__(self, index):
-        img = self.x_train[index][0]
-        depth = self.x_train[index][1]
-        if self.transform:
-            x = self.transform(img)
-            x_depth = self.transform(depth)
-        return {'image': x, 'depth': x_depth, 'label': torch.from_numpy(self.x_train[index][2])}
+        x_imgs = []
+        x_depths = []
+        x_labels = []
+        for i in range(index, index+self.window):
+            img = self.x_train[index][0]
+            depth = self.x_train[index][1]
+            label = torch.from_numpy(self.x_train[index][2])
+            if self.transform:
+                img = self.transform(img)
+                depth = self.transform(depth)
+            x_imgs.append(img)
+            x_depths.append(depth)
+            x_labels.append(label)
+
+        x_imgs = torch.stack(x_imgs)
+        x_depths = torch.stack(x_depths)
+        x_labels = torch.stack(x_labels)
+        x_imgs = torch.squeeze(x_imgs, 0)
+        x_depths = torch.squeeze(x_depths, 0)
+        x_labels = torch.squeeze(x_labels, 0)
+        #print(f'Window Size:  {index} {index + self.window}')
+
+        return {'image': x_imgs, 'depth': x_depths, 'label': x_labels}
 
 
 
@@ -61,7 +79,7 @@ transform = transforms.Compose(
 def read_rgb_and_depth_to_numpy(rgb_files, depth_files):
     X_train = []
     for img, depth in zip(rgb_files, depth_files):
-        X_train.append([cv2.resize(cv2.imread(img), (224,224)), cv2.resize(cv2.imread(img), (224,224))])
+        X_train.append([cv2.resize(cv2.imread(img), (224,224)), cv2.resize(cv2.imread(depth), (224,224))])
     return np.array(X_train)
 
 def generate_labels(files_labels):
@@ -74,12 +92,27 @@ def generate_labels(files_labels):
     def relative_rotations(poses):
         """
         Find relative rotation between two frames
+        The transform is calculated with the help of following logic:
+        P = r1.T * r2     r1.T(t1 - t2)
+            0             1
+
+        P1 = r1     t1
+             0      1
+
+
+        P2 = r2     t2
+             0      1
+
         """
         labels = []
-        for r0, r1 in zip(poses, poses[1:]):
-            r0_r1 = r1.dot(r0.T)
-            r0_r1 = r0_r1.ravel()[:12]
-            labels.append(r0_r1)
+        for h0, h1 in zip(poses, poses[1:]):
+            r0, t0 = h0[:3, :3], h0[:3, 3]
+            r1, t1 = h1[:3, :3], h1[:3, 3]
+            r0_r1 = r0.dot(r1.T)
+            t0_t1 = np.dot(r1.T, t0 - t1)
+            r = R.from_matrix(r0_r1)
+            final_r_t = np.append(r.as_quat(), t0_t1)
+            labels.append(final_r_t)
         return labels
     for i in range(len(files_labels)):
         label_list = []
@@ -102,9 +135,10 @@ def train_load_util(base_path, batch_size):
     # Load dataset into Numpy array.
     train_data = PoseDataset(X_train, train_labels, transform=transform)
     train_len = len(train_data)
-    train_set, val_set = random_split(train_data, [int(train_len * 0.8), train_len - int(train_len * 0.8)])
-    trainloader = torch.utils.data.DataLoader(train_set, batch_size=batch_size,
-                                              shuffle=True, num_workers=2, drop_last=True)
-    testloader = torch.utils.data.DataLoader(val_set, batch_size=batch_size,
-                                              shuffle=True, num_workers=2, drop_last=True)
+    train_set = torch.utils.data.Subset(train_data, range(int(train_len * 0.8)))
+    val_set = torch.utils.data.Subset(train_data, range(int(train_len * 0.8), train_len))
+    trainloader = torch.utils.data.DataLoader(train_set, batch_size=1,
+                                              num_workers=2, drop_last=True)
+    testloader = torch.utils.data.DataLoader(val_set, batch_size=1,
+                                             num_workers=2, drop_last=True)
     return trainloader, testloader
